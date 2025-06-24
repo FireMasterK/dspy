@@ -36,7 +36,7 @@ class LM(BaseLM):
         cache_in_memory: bool = True,
         callbacks: Optional[List[BaseCallback]] = None,
         num_retries: int = 3,
-        provider=None,
+        provider: Optional[Provider] = None,
         reasoning_model: Optional[bool] = None,
         finetuning_model: Optional[str] = None,
         launch_kwargs: Optional[dict[str, Any]] = None,
@@ -271,6 +271,9 @@ def _get_stream_completion_fn(
     # The stream is already opened, and will be closed by the caller.
     stream = cast(MemoryObjectSendStream, stream)
     caller_predict_id = id(caller_predict) if caller_predict else None
+
+    if dspy.settings.track_usage:
+        request["stream_options"] = {"include_usage": True}
 
     async def stream_completion(request: Dict[str, Any], cache_kwargs: Dict[str, Any]):
         response = await litellm.acompletion(
