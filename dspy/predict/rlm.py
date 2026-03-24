@@ -30,7 +30,6 @@ from dspy.signatures.signature import ensure_signature
 from dspy.utils.annotation import experimental
 
 if TYPE_CHECKING:
-
     from dspy.signatures.signature import Signature
 
 logger = logging.getLogger(__name__)
@@ -66,6 +65,9 @@ _PYTHON_FENCE_LANGS = {"python", "py", "python3", "py3", ""}
 
 def _strip_code_fences(code: str) -> str:
     """Extract Python code from markdown fences, or return as-is if no fences."""
+    if not code:
+        raise ValueError("Code can't be empty.")
+
     code = code.strip()
     if "```" not in code:
         return code
@@ -81,7 +83,7 @@ def _strip_code_fences(code: str) -> str:
 
     # Find the first opening fence (skip any text before it)
     fence_start = code.find("```")
-    lang_line, separator, remainder = code[fence_start + 3:].partition("\n")
+    lang_line, separator, remainder = code[fence_start + 3 :].partition("\n")
     if not separator:
         return code
 
@@ -195,7 +197,7 @@ class RLM(Module):
 
     def _validate_tools(self, tools: dict[str, Tool]) -> None:
         """Validate user-provided tools have valid names."""
-        for name, tool in tools.items():
+        for name in tools:
             if not name.isidentifier():
                 raise ValueError(f"Invalid tool name '{name}': must be a valid Python identifier")
             if name in self._RESERVED_TOOL_NAMES:
@@ -291,10 +293,7 @@ class RLM(Module):
         # Simple names for SUBMIT() examples
         final_output_names = ", ".join(self.signature.output_fields.keys())
 
-        output_fields = "\n".join(
-            f"- {translate_field_type(n, f)}"
-            for n, f in self.signature.output_fields.items()
-        )
+        output_fields = "\n".join(f"- {translate_field_type(n, f)}" for n, f in self.signature.output_fields.items())
 
         # Include original signature instructions (docstring) if present
         task_instructions = f"{self.signature.instructions}\n\n" if self.signature.instructions else ""
@@ -303,15 +302,42 @@ class RLM(Module):
         tool_docs = self._format_tool_docs(self._user_tools)
 
         action_sig = (
-            dspy.Signature({}, task_instructions + ACTION_INSTRUCTIONS_TEMPLATE.format(
-                inputs=inputs_str, final_output_names=final_output_names, output_fields=output_fields,
-                max_llm_calls=self.max_llm_calls,
-            ) + tool_docs)
-            .append("variables_info", dspy.InputField(desc="Metadata about the variables available in the REPL"), type_=str)
-            .append("repl_history", dspy.InputField(desc="Previous REPL code executions and their outputs"), type_=REPLHistory)
-            .append("iteration", dspy.InputField(desc="Current iteration number (1-indexed) out of max_iterations"), type_=str)
-            .append("reasoning", dspy.OutputField(desc="Think step-by-step: what do you know? What remains? Plan your next action."), type_=str)
-            .append("code", dspy.OutputField(desc="Python code to execute. Use markdown code block format: ```python\\n<code>\\n```"), type_=str)
+            dspy.Signature(
+                {},
+                task_instructions
+                + ACTION_INSTRUCTIONS_TEMPLATE.format(
+                    inputs=inputs_str,
+                    final_output_names=final_output_names,
+                    output_fields=output_fields,
+                    max_llm_calls=self.max_llm_calls,
+                )
+                + tool_docs,
+            )
+            .append(
+                "variables_info", dspy.InputField(desc="Metadata about the variables available in the REPL"), type_=str
+            )
+            .append(
+                "repl_history",
+                dspy.InputField(desc="Previous REPL code executions and their outputs"),
+                type_=REPLHistory,
+            )
+            .append(
+                "iteration",
+                dspy.InputField(desc="Current iteration number (1-indexed) out of max_iterations"),
+                type_=str,
+            )
+            .append(
+                "reasoning",
+                dspy.OutputField(desc="Think step-by-step: what do you know? What remains? Plan your next action."),
+                type_=str,
+            )
+            .append(
+                "code",
+                dspy.OutputField(
+                    desc="Python code to execute. Use markdown code block format: ```python\\n<code>\\n```"
+                ),
+                type_=str,
+            )
         )
 
         # Extract signature: includes the original signature's output fields and task instructions.
@@ -322,15 +348,21 @@ class RLM(Module):
         # Prepend original task instructions to extract instructions so the LLM knows what task to extract for
         extended_task_instructions = ""
         if task_instructions:
-            extended_task_instructions = "The trajectory was generated with the following objective: \n" + task_instructions + "\n"
+            extended_task_instructions = (
+                "The trajectory was generated with the following objective: \n" + task_instructions + "\n"
+            )
         full_extract_instructions = extended_task_instructions + extract_instructions
 
         extract_sig = dspy.Signature(
             {**self.signature.output_fields},
             full_extract_instructions,
         )
-        extract_sig = extract_sig.prepend("repl_history", dspy.InputField(desc="Your REPL interactions so far"), type_=REPLHistory)
-        extract_sig = extract_sig.prepend("variables_info", dspy.InputField(desc="Metadata about the variables available in the REPL"), type_=str)
+        extract_sig = extract_sig.prepend(
+            "repl_history", dspy.InputField(desc="Your REPL interactions so far"), type_=REPLHistory
+        )
+        extract_sig = extract_sig.prepend(
+            "variables_info", dspy.InputField(desc="Metadata about the variables available in the REPL"), type_=str
+        )
 
         return action_sig, extract_sig
 
@@ -377,8 +409,7 @@ class RLM(Module):
     def _prepare_execution_tools(self) -> dict[str, Callable]:
         """Create fresh LLM tools and merge with user-provided tools."""
         execution_tools = self._make_llm_tools()
-        # Extract underlying functions from Tool objects for the interpreter
-        execution_tools.update({name: tool.func for name, tool in self._user_tools.items()})
+        execution_tools.update({name: tool.as_sync_callable() for name, tool in self._user_tools.items()})
         return execution_tools
 
     def _inject_execution_context(self, interpreter: CodeInterpreter, execution_tools: dict[str, Callable]) -> None:
@@ -446,12 +477,18 @@ class RLM(Module):
 
         # Validate raw_output is a dict
         if not isinstance(raw_output, dict):
-            return None, f"[Error] FINAL returned {type(raw_output).__name__}, expected dict with fields: {output_field_names}"
+            return (
+                None,
+                f"[Error] FINAL returned {type(raw_output).__name__}, expected dict with fields: {output_field_names}",
+            )
 
         # Validate all required output fields are present
         missing = set(output_field_names) - set(raw_output.keys())
         if missing:
-            return None, f"[Error] Missing output fields: {sorted(missing)}. Use SUBMIT({', '.join(output_field_names)})"
+            return (
+                None,
+                f"[Error] Missing output fields: {sorted(missing)}. Use SUBMIT({', '.join(output_field_names)})",
+            )
 
         # Parse and validate each output field
         parsed_outputs = {}
@@ -506,9 +543,7 @@ class RLM(Module):
             if error:
                 return history.append(reasoning=pred.reasoning, code=code, output=error)
 
-            final_history = history.append(
-                reasoning=pred.reasoning, code=code, output=f"FINAL: {parsed_outputs}"
-            )
+            final_history = history.append(reasoning=pred.reasoning, code=code, output=f"FINAL: {parsed_outputs}")
             return Prediction(
                 **parsed_outputs,
                 trajectory=[e.model_dump() for e in final_history],
@@ -536,6 +571,7 @@ class RLM(Module):
         try:
             return repl.execute(code, variables=dict(input_args))
         except (CodeInterpreterError, SyntaxError) as e:
+            print(f"Code execution error: {e}")
             return f"[Error] {e}"
 
     def _execute_iteration(
@@ -566,6 +602,9 @@ class RLM(Module):
             code = action.code
             result = f"[Error] {e}"
             return self._process_execution_result(action, code, result, history, output_field_names)
+        except ValueError as e:
+            result = f"[Error] {e}"
+            return self._process_execution_result(action, action.code, result, history, output_field_names)
         result = self._execute_code(repl, code, input_args)
         return self._process_execution_result(action, code, result, history, output_field_names)
 
@@ -644,8 +683,7 @@ class RLM(Module):
         )
         if self.verbose:
             logger.info(
-                f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
-                f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
+                f"RLM iteration {iteration + 1}/{self.max_iterations}\nReasoning: {pred.reasoning}\nCode:\n{pred.code}"
             )
 
         try:

@@ -83,7 +83,7 @@ class CodeInterpreter(Protocol):
     """
 
     @property
-    def tools(self) -> dict[str, Callable[..., str]]:
+    def tools(self) -> dict[str, Callable[..., Any]]:
         """Tools available for interpreter code to call.
 
         Tools are host-side functions that can be invoked from within the

@@ -1,5 +1,7 @@
 import asyncio
+import functools
 import inspect
+import threading
 from typing import TYPE_CHECKING, Any, Callable, get_origin, get_type_hints
 
 import pydantic
@@ -163,20 +165,70 @@ class Tool(Type):
         }
 
     def _run_async_in_sync(self, coroutine):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Run the coroutine outside of "except" block to avoid propagation
-            loop = None
+        runner = functools.partial(asyncio.run, coroutine)
 
-        if loop is None:
-            return asyncio.run(coroutine)
-        return loop.run_until_complete(coroutine)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return runner()
+
+        result: dict[str, Any] = {}
+        error: dict[str, BaseException] = {}
+
+        def run_in_thread() -> None:
+            try:
+                result["value"] = runner()
+            except BaseException as exc:  # noqa: BLE001 - preserve original tool errors
+                error["error"] = exc
+
+        worker = threading.Thread(target=run_in_thread, daemon=True)
+        worker.start()
+        worker.join()
+
+        if "error" in error:
+            raise error["error"]
+        return result.get("value")
+
+    def _invoke(self, **kwargs):
+        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+        return self.func(**parsed_kwargs)
+
+    @with_callbacks
+    def _call_blocking(self, **kwargs):
+        result = self._invoke(**kwargs)
+        if asyncio.iscoroutine(result):
+            return self._run_async_in_sync(result)
+        return result
+
+    def as_sync_callable(self) -> Callable[..., Any]:
+        """Return a plain callable that blocks on async results.
+
+        This is useful for sync-only execution environments such as the RLM's
+        sandbox interpreter, which expects plain host-side callables.
+        """
+
+        def sync_callable(**kwargs):
+            return self._call_blocking(**kwargs)
+
+        functools.update_wrapper(sync_callable, self.func)
+        sync_callable.__name__ = self.name or sync_callable.__name__
+        sync_callable.__qualname__ = self.name or sync_callable.__qualname__
+        if self.desc:
+            sync_callable.__doc__ = self.desc
+
+        annotations_func = (
+            self.func if inspect.isfunction(self.func) or inspect.ismethod(self.func) else self.func.__call__
+        )
+        try:
+            sync_callable.__signature__ = inspect.signature(annotations_func)
+        except (TypeError, ValueError):
+            pass
+
+        return sync_callable
 
     @with_callbacks
     def __call__(self, **kwargs):
-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
-        result = self.func(**parsed_kwargs)
+        result = self._invoke(**kwargs)
         if asyncio.iscoroutine(result):
             if settings.allow_tool_async_sync_conversion:
                 return self._run_async_in_sync(result)
@@ -190,8 +242,7 @@ class Tool(Type):
 
     @with_callbacks
     async def acall(self, **kwargs):
-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
-        result = self.func(**parsed_kwargs)
+        result = self._invoke(**kwargs)
         if asyncio.iscoroutine(result):
             return await result
         else:
@@ -310,7 +361,9 @@ class ToolCalls(Type):
                         break
 
             if func is None:
-                raise ValueError(f"Tool function '{self.name}' not found. Please pass the tool functions to the `execute` method.")
+                raise ValueError(
+                    f"Tool function '{self.name}' not found. Please pass the tool functions to the `execute` method."
+                )
 
             try:
                 args = self.args or {}

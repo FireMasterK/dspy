@@ -105,7 +105,7 @@ class PythonInterpreter:
         enable_env_vars: list[str] | None = None,
         enable_network_access: list[str] | None = None,
         sync_files: bool = True,
-        tools: dict[str, Callable[..., str]] | None = None,
+        tools: dict[str, Callable[..., Any]] | None = None,
         output_fields: list[dict] | None = None,
     ) -> None:
         """
@@ -117,9 +117,9 @@ class PythonInterpreter:
             enable_env_vars: Environment variable names to allow in the sandbox.
             enable_network_access: Domains or IPs to allow network access in the sandbox.
             sync_files: If set, syncs changes within the sandbox back to original files after execution.
-            tools: Dictionary mapping tool names to callable functions.
-                   Each function should accept keyword arguments and return a string.
-                   Tools are callable directly from sandbox code by name.
+                 tools: Dictionary mapping tool names to callable functions.
+                     Each function should accept keyword arguments and return a string.
+                     Tools are callable directly from sandbox code by name.
             output_fields: List of output field definitions for typed SUBMIT signature.
                    Each dict should have 'name' and optionally 'type' keys.
         """
@@ -196,12 +196,7 @@ class PythonInterpreter:
             return os.environ["DENO_DIR"]
 
         try:
-            result = subprocess.run(
-                ["deno", "info", "--json"],
-                capture_output=True,
-                text=True,
-                check=False
-            )
+            result = subprocess.run(["deno", "info", "--json"], capture_output=True, text=True, check=False)
             if result.returncode == 0:
                 info = json.loads(result.stdout)
                 return info.get("denoDir")
@@ -272,10 +267,7 @@ class PythonInterpreter:
         if self.tools:
             tools_info = []
             for name, fn in self.tools.items():
-                tools_info.append({
-                    "name": name,
-                    "parameters": self._extract_parameters(fn)
-                })
+                tools_info.append({"name": name, "parameters": self._extract_parameters(fn)})
             params["tools"] = tools_info
 
         if self.output_fields:
@@ -302,8 +294,11 @@ class PythonInterpreter:
             result = self.tools[tool_name](**kwargs)
             is_json = isinstance(result, (list, dict))
             response = _jsonrpc_result(
-                {"value": json.dumps(result) if is_json else (str(result) if result is not None else ""), "type": "json" if is_json else "string"},
-                request_id
+                {
+                    "value": json.dumps(result) if is_json else (str(result) if result is not None else ""),
+                    "type": "json" if is_json else "string",
+                },
+                request_id,
             )
         except Exception as e:
             error_type = type(e).__name__
@@ -326,7 +321,7 @@ class PythonInterpreter:
                     stderr=subprocess.PIPE,
                     text=True,
                     encoding="UTF-8",
-                    env=os.environ.copy()
+                    env=os.environ.copy(),
                 )
             except FileNotFoundError as e:
                 install_instructions = (
@@ -387,7 +382,9 @@ class PythonInterpreter:
                 continue
 
             if response.get("id") != request_id:
-                raise CodeInterpreterError(f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}")
+                raise CodeInterpreterError(
+                    f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}"
+                )
             if "error" in response:
                 raise CodeInterpreterError(f"Error {context}: {response['error'].get('message', 'Unknown error')}")
             return response
@@ -461,10 +458,7 @@ class PythonInterpreter:
             items = ", ".join(self._serialize_value(item) for item in value)
             return f"[{items}]"
         elif isinstance(value, dict):
-            items = ", ".join(
-                f"{self._serialize_value(k)}: {self._serialize_value(v)}"
-                for k, v in value.items()
-            )
+            items = ", ".join(f"{self._serialize_value(k)}: {self._serialize_value(v)}" for k, v in value.items())
             return f"{{{items}}}"
         elif isinstance(value, set):
             # Sets become sorted lists (or unsorted if mixed types) for JSON compatibility
@@ -532,7 +526,9 @@ class PythonInterpreter:
             # Handle success response
             if "result" in msg:
                 if msg.get("id") != execute_request_id:
-                    raise CodeInterpreterError(f"Response ID mismatch: expected {execute_request_id}, got {msg.get('id')}")
+                    raise CodeInterpreterError(
+                        f"Response ID mismatch: expected {execute_request_id}, got {msg.get('id')}"
+                    )
                 result = msg["result"]
                 self._sync_files()
                 # Check for SUBMIT (encoded as success with "final" field)
@@ -545,7 +541,9 @@ class PythonInterpreter:
                 # Errors with id=null are unsolicited errors (e.g., unhandled async rejections)
                 # Treat them as errors for the current request
                 if msg.get("id") is not None and msg.get("id") != execute_request_id:
-                    raise CodeInterpreterError(f"Response ID mismatch: expected {execute_request_id}, got {msg.get('id')}")
+                    raise CodeInterpreterError(
+                        f"Response ID mismatch: expected {execute_request_id}, got {msg.get('id')}"
+                    )
                 error = msg["error"]
                 error_code = error.get("code", JSONRPC_APP_ERRORS["Unknown"])
                 error_message = error.get("message", "Unknown error")

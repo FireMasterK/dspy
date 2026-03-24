@@ -393,6 +393,24 @@ def test_async_tool_call_in_sync_mode():
         assert result == "hello 1"
 
 
+@pytest.mark.asyncio
+async def test_async_tool_call_in_sync_mode_inside_running_loop():
+    tool = Tool(async_dummy_function)
+
+    with dspy.context(allow_tool_async_sync_conversion=True):
+        result = tool(x=2, y="hello")
+        assert result == "hello 2"
+
+
+@pytest.mark.asyncio
+async def test_async_tool_as_sync_callable_inside_running_loop():
+    tool = Tool(async_dummy_function)
+    sync_callable = tool.as_sync_callable()
+
+    result = sync_callable(x=3, y="hello")
+    assert result == "hello 3"
+
+
 TOOL_CALL_TEST_CASES = [
     ([], {"tool_calls": []}),
     (
@@ -542,8 +560,6 @@ def test_tool_convert_input_schema_to_tool_args_lang_chain():
     }
 
 
-
-
 def test_tool_call_execute():
     def get_weather(city: str) -> str:
         return f"The weather in {city} is sunny"
@@ -551,10 +567,7 @@ def test_tool_call_execute():
     def add_numbers(a: int, b: int) -> int:
         return a + b
 
-    tools = [
-        dspy.Tool(get_weather),
-        dspy.Tool(add_numbers)
-    ]
+    tools = [dspy.Tool(get_weather), dspy.Tool(add_numbers)]
 
     tool_call = dspy.ToolCalls.ToolCall(name="get_weather", args={"city": "Berlin"})
     result = tool_call.execute(functions=tools)

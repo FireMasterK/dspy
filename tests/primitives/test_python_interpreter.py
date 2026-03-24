@@ -299,6 +299,7 @@ def test_tool_default_args():
 
 def test_tools_re_register_after_process_restart():
     """Tools should remain callable after Deno subprocess restart."""
+
     def echo(message: str = "") -> str:
         return f"Echo: {message}"
 
@@ -322,22 +323,14 @@ def test_mounts_replay_after_process_restart(tmp_path):
     virtual_path = f"/sandbox/{host_file.name}"
 
     with PythonInterpreter(enable_read_paths=[str(host_file)]) as interpreter:
-        first = interpreter.execute(
-            f"with open({virtual_path!r}, 'r') as f:\n"
-            f"    data = f.read()\n"
-            f"data"
-        )
+        first = interpreter.execute(f"with open({virtual_path!r}, 'r') as f:\n    data = f.read()\ndata")
         assert first == "restarted-ok"
 
         first_pid = interpreter.deno_process.pid
         interpreter.deno_process.kill()
         interpreter.deno_process.wait()
 
-        second = interpreter.execute(
-            f"with open({virtual_path!r}, 'r') as f:\n"
-            f"    data = f.read()\n"
-            f"data"
-        )
+        second = interpreter.execute(f"with open({virtual_path!r}, 'r') as f:\n    data = f.read()\ndata")
         assert second == "restarted-ok"
         assert interpreter.deno_process.pid != first_pid
 
@@ -374,7 +367,6 @@ def test_tool_error_surfaces_as_runtime_error():
         )
         assert "ValueError" in result
         assert "bad value: 42" in result
-
 
 
 # =============================================================================
