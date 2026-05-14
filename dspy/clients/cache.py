@@ -61,10 +61,29 @@ class Cache:
             self.disk_cache = {}
 
         self._lock = threading.RLock()
+        self.close()
+
+    def close(self) -> None:
+        if not self.enable_disk_cache:
+            return
+
+        try:
+            self.disk_cache.close()
+        except Exception:
+            logger.debug("Failed to close disk cache connections.", exc_info=True)
+
+    def _close_disk_cache_connections(self) -> None:
+        if not self.enable_disk_cache:
+            return
+
+        self.close()
 
     def __contains__(self, key: str) -> bool:
         """Check if a key is in the cache."""
-        return key in self.memory_cache or key in self.disk_cache
+        try:
+            return key in self.memory_cache or key in self.disk_cache
+        finally:
+            self._close_disk_cache_connections()
 
     def cache_key(self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None = None) -> str:
         """
@@ -100,34 +119,36 @@ class Cache:
         return sha256(orjson.dumps(params, option=orjson.OPT_SORT_KEYS)).hexdigest()
 
     def get(self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None = None) -> Any:
-
-        if not self.enable_memory_cache and not self.enable_disk_cache:
-            return None
-
         try:
-            key = self.cache_key(request, ignored_args_for_cache_key)
-        except Exception:
-            logger.debug(f"Failed to generate cache key for request: {request}")
-            return None
+            if not self.enable_memory_cache and not self.enable_disk_cache:
+                return None
 
-        if self.enable_memory_cache and key in self.memory_cache:
-            with self._lock:
-                response = self.memory_cache[key]
-        elif self.enable_disk_cache and key in self.disk_cache:
-            # Found on disk but not in memory cache, add to memory cache
-            response = self.disk_cache[key]
-            if self.enable_memory_cache:
+            try:
+                key = self.cache_key(request, ignored_args_for_cache_key)
+            except Exception:
+                logger.debug(f"Failed to generate cache key for request: {request}")
+                return None
+
+            if self.enable_memory_cache and key in self.memory_cache:
                 with self._lock:
-                    self.memory_cache[key] = response
-        else:
-            return None
+                    response = self.memory_cache[key]
+            elif self.enable_disk_cache and key in self.disk_cache:
+                # Found on disk but not in memory cache, add to memory cache
+                response = self.disk_cache[key]
+                if self.enable_memory_cache:
+                    with self._lock:
+                        self.memory_cache[key] = response
+            else:
+                return None
 
-        response = copy.deepcopy(response)
-        if hasattr(response, "usage"):
-            # Clear the usage data when cache is hit, because no LM call is made
-            response.usage = {}
-            response.cache_hit = True
-        return response
+            response = copy.deepcopy(response)
+            if hasattr(response, "usage"):
+                # Clear the usage data when cache is hit, because no LM call is made
+                response.usage = {}
+                response.cache_hit = True
+            return response
+        finally:
+            self._close_disk_cache_connections()
 
     def put(
         self,
@@ -136,28 +157,31 @@ class Cache:
         ignored_args_for_cache_key: list[str] | None = None,
         enable_memory_cache: bool = True,
     ) -> None:
-        enable_memory_cache = self.enable_memory_cache and enable_memory_cache
-
-        # Early return to avoid computing cache key if both memory and disk cache are disabled
-        if not enable_memory_cache and not self.enable_disk_cache:
-            return
-
         try:
-            key = self.cache_key(request, ignored_args_for_cache_key)
-        except Exception:
-            logger.debug(f"Failed to generate cache key for request: {request}")
-            return
+            enable_memory_cache = self.enable_memory_cache and enable_memory_cache
 
-        if enable_memory_cache:
-            with self._lock:
-                self.memory_cache[key] = value
+            # Early return to avoid computing cache key if both memory and disk cache are disabled
+            if not enable_memory_cache and not self.enable_disk_cache:
+                return
 
-        if self.enable_disk_cache:
             try:
-                self.disk_cache[key] = value
-            except Exception as e:
-                # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
-                logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+                key = self.cache_key(request, ignored_args_for_cache_key)
+            except Exception:
+                logger.debug(f"Failed to generate cache key for request: {request}")
+                return
+
+            if enable_memory_cache:
+                with self._lock:
+                    self.memory_cache[key] = value
+
+            if self.enable_disk_cache:
+                try:
+                    self.disk_cache[key] = value
+                except Exception as e:
+                    # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                    logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+        finally:
+            self._close_disk_cache_connections()
 
     def reset_memory_cache(self) -> None:
         if not self.enable_memory_cache:
@@ -176,8 +200,10 @@ class Cache:
 
     def load_memory_cache(self, filepath: str, allow_pickle: bool = False) -> None:
         if not allow_pickle:
-            raise ValueError("Loading untrusted .pkl files can run arbitrary code, which may be dangerous. \
-            Set `allow_pickle=True` to load if you are running in a trusted environment and the file is from a trusted source.")
+            raise ValueError(
+                "Loading untrusted .pkl files can run arbitrary code, which may be dangerous. \
+            Set `allow_pickle=True` to load if you are running in a trusted environment and the file is from a trusted source."
+            )
 
         if not self.enable_memory_cache:
             return

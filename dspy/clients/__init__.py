@@ -34,6 +34,14 @@ def configure_cache(
                             bounds, set this parameter to `math.inf` or a similar value.
     """
 
+    global DSPY_CACHE
+
+    enable_disk_cache = True if enable_disk_cache is None else enable_disk_cache
+    enable_memory_cache = True if enable_memory_cache is None else enable_memory_cache
+    disk_cache_dir = DISK_CACHE_DIR if disk_cache_dir is None else disk_cache_dir
+
+    old_cache = DSPY_CACHE
+
     DSPY_CACHE = Cache(
         enable_disk_cache,
         enable_memory_cache,
@@ -46,6 +54,9 @@ def configure_cache(
 
     # Update the reference to point to the new cache
     dspy.cache = DSPY_CACHE
+
+    if old_cache is not DSPY_CACHE and hasattr(old_cache, "close"):
+        old_cache.close()
 
 
 litellm.telemetry = False
@@ -78,6 +89,7 @@ def _get_dspy_cache():
 
 
 DSPY_CACHE = _get_dspy_cache()
+
 
 def configure_litellm_logging(level: str = "ERROR"):
     """Configure LiteLLM logging to the specified level."""

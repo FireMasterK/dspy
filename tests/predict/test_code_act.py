@@ -12,9 +12,11 @@ class BasicQA(Signature):
     question = dspy.InputField()
     answer = dspy.OutputField(desc="often between 1 and 5 words")
 
+
 def add(a: float, b: float) -> float:
     "add two numbers"
     return a + b
+
 
 def test_codeact_code_generation():
     lm = DummyLM(
@@ -43,9 +45,11 @@ class ExtremumFinder(Signature):
     maximum = dspy.OutputField(desc="The maximum of the given numbers")
     minimum = dspy.OutputField(desc="The minimum of the given numbers")
 
+
 def extract_maximum_minimum(input_list: str) -> dict[str, float]:
     numbers = list(map(float, input_list.split(",")))
     return {"maximum": max(numbers), "minimum": min(numbers)}
+
 
 def test_codeact_support_multiple_fields():
     lm = DummyLM(
@@ -64,7 +68,7 @@ def test_codeact_support_multiple_fields():
     assert res.maximum == "6"
     assert res.minimum == "2"
     assert res.trajectory == {
-        "code_output_0": '"{\'maximum\': 6.0, \'minimum\': 2.0}\\n"',
+        "code_output_0": "\"{'maximum': 6.0, 'minimum': 2.0}\\n\"",
         "generated_code_0": "result = extract_maximum_minimum('2, 3, 5, 6')\nprint(result)",
     }
     assert program.interpreter.deno_process is None
@@ -90,12 +94,12 @@ def test_codeact_code_parse_failure():
     program = CodeAct(BasicQA, tools=[add])
     res = program(question="What is 1+1?")
     assert res.answer == "2"
-    assert res.trajectory == {
-        "generated_code_0": "parse(error",
-        "observation_0": "Failed to execute the generated code: Invalid Python syntax. message: ",
-        "generated_code_1": "result = add(1,1)\nprint(result)",
-        "code_output_1": '"2\\n"',
-    }
+    assert res.trajectory["generated_code_0"] == "parse(error"
+    observation = res.trajectory["observation_0"]
+    assert observation.startswith("Failed to execute the generated code: Invalid Python syntax. message: ")
+    assert observation != "Failed to execute the generated code: Invalid Python syntax. message: "
+    assert res.trajectory["generated_code_1"] == "result = add(1,1)\nprint(result)"
+    assert res.trajectory["code_output_1"] == '"2\\n"'
     assert program.interpreter.deno_process is None
 
 
@@ -121,7 +125,7 @@ def test_codeact_code_execution_failure():
     assert res.answer == "2"
     assert res.trajectory == {
         "generated_code_0": "unknown+1",
-        "observation_0": 'Failed to execute the generated code: NameError: ["name \'unknown\' is not defined"]',
+        "observation_0": "Failed to execute the generated code: NameError: [\"name 'unknown' is not defined\"]",
         "generated_code_1": "result = add(1,1)\nprint(result)",
         "code_output_1": '"2\\n"',
     }
@@ -131,6 +135,7 @@ def test_codeact_code_execution_failure():
 class CustomTool:
     def __call__(self, a: float, b: float) -> float:
         return a + b
+
 
 def test_codeact_tool_validation():
     with pytest.raises(ValueError, match="CodeAct only accepts functions and not callable objects."):

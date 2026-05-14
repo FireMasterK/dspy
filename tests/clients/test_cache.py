@@ -1,5 +1,7 @@
 import os
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import patch
 
 import pydantic
@@ -140,6 +142,77 @@ def test_put_and_get(cache):
 
     # Verify it was also added back to memory cache
     assert cache.cache_key(request) in cache.memory_cache
+
+
+def test_worker_thread_closes_disk_cache_connections(cache):
+    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
+
+    with patch.object(cache.disk_cache, "close", wraps=cache.disk_cache.close) as mock_close:
+
+        def worker():
+            cache.put(request, "value")
+            cache.reset_memory_cache()
+            assert cache.get(request) == "value"
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+    assert mock_close.call_count >= 2
+
+
+def test_main_thread_closes_disk_cache_connections(cache):
+    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
+
+    with patch.object(cache.disk_cache, "close", wraps=cache.disk_cache.close) as mock_close:
+        cache.put(request, "value")
+        cache.reset_memory_cache()
+        assert cache.get(request) == "value"
+
+    assert mock_close.call_count >= 2
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="requires /proc fd inspection")
+def test_worker_threads_do_not_accumulate_disk_cache_fds(tmp_path):
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024 * 1024,
+        memory_max_entries=100,
+    )
+
+    def count_cache_fds():
+        total = 0
+        for fd_path in Path("/proc/self/fd").iterdir():
+            try:
+                target = os.readlink(fd_path)
+            except OSError:
+                continue
+            if str(tmp_path) in target:
+                total += 1
+        return total
+
+    baseline = count_cache_fds()
+
+    def worker(worker_id: int):
+        for item_id in range(64):
+            request = {"worker": worker_id, "item": item_id}
+            cache.put(request, {"value": item_id})
+
+        cache.reset_memory_cache()
+
+        for item_id in range(64):
+            request = {"worker": worker_id, "item": item_id}
+            assert cache.get(request) == {"value": item_id}
+
+    for worker_id in range(4):
+        thread = threading.Thread(target=worker, args=(worker_id,))
+        thread.start()
+        thread.join()
+
+    assert count_cache_fds() <= baseline
+    cache.close()
 
 
 def test_cache_miss(cache):
@@ -369,3 +442,24 @@ def test_cache_fallback_on_restricted_environment():
             os.environ.pop("DSPY_CACHEDIR", None)
         else:
             os.environ["DSPY_CACHEDIR"] = old_env
+
+
+def test_configure_cache_closes_previous_global_cache(tmp_path):
+    import dspy
+    import dspy.clients as clients
+
+    original_cache = clients.DSPY_CACHE
+
+    try:
+        with patch.object(original_cache, "close", wraps=original_cache.close) as mock_close:
+            clients.configure_cache(disk_cache_dir=str(tmp_path))
+
+            assert clients.DSPY_CACHE is dspy.cache
+            assert clients.DSPY_CACHE is not original_cache
+            mock_close.assert_called_once()
+    finally:
+        new_cache = clients.DSPY_CACHE
+        if new_cache is not original_cache:
+            new_cache.close()
+            clients.DSPY_CACHE = original_cache
+            dspy.cache = original_cache

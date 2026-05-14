@@ -12,7 +12,9 @@ import json
 import keyword
 import logging
 import os
+import select
 import subprocess
+import sys
 import threading
 from os import PathLike
 from typing import Any, Callable
@@ -26,6 +28,8 @@ logger = logging.getLogger(__name__)
 # Pyodide's FFI crashes at exactly 128MB (134,217,728 bytes). Use filesystem
 # injection for strings above 100MB to stay safely below this limit.
 LARGE_VAR_THRESHOLD = 100 * 1024 * 1024
+
+DEFAULT_MAX_CPU_TIME_SECONDS = 8.0
 
 # =============================================================================
 # JSON-RPC 2.0 Helpers
@@ -42,6 +46,7 @@ JSONRPC_APP_ERRORS = {
     "KeyError": -32006,
     "RuntimeError": -32007,
     "CodeInterpreterError": -32008,
+    "MemoryError": -32009,
     "Unknown": -32099,
 }
 
@@ -104,6 +109,8 @@ class PythonInterpreter:
         enable_write_paths: list[PathLike | str] | None = None,
         enable_env_vars: list[str] | None = None,
         enable_network_access: list[str] | None = None,
+        max_cpu_time_seconds: float | None = DEFAULT_MAX_CPU_TIME_SECONDS,
+        max_tool_calls_per_execution: int | None = None,
         sync_files: bool = True,
         tools: dict[str, Callable[..., Any]] | None = None,
         output_fields: list[dict] | None = None,
@@ -116,6 +123,13 @@ class PythonInterpreter:
                 All write paths will also be able to be read from for mounting.
             enable_env_vars: Environment variable names to allow in the sandbox.
             enable_network_access: Domains or IPs to allow network access in the sandbox.
+            max_cpu_time_seconds: Per-execution CPU time budget for sandboxed Python code.
+                Defaults to 8 seconds. Pass ``None`` to disable the CPU budget for an interpreter instance.
+                When set, long-running Python loops are interrupted once the execution exceeds
+                the configured process CPU time budget.
+            max_tool_calls_per_execution: Maximum number of host-side tool calls allowed during a single
+                ``execute()`` call. Pass ``None`` to disable the limit. When exceeded, the sandbox is
+                restarted and the current execution fails fast.
             sync_files: If set, syncs changes within the sandbox back to original files after execution.
                  tools: Dictionary mapping tool names to callable functions.
                      Each function should accept keyword arguments and return a string.
@@ -130,6 +144,8 @@ class PythonInterpreter:
         self.enable_write_paths = enable_write_paths or []
         self.enable_env_vars = enable_env_vars or []
         self.enable_network_access = enable_network_access or []
+        self.max_cpu_time_seconds = self._validate_max_cpu_time_seconds(max_cpu_time_seconds)
+        self.max_tool_calls_per_execution = self._validate_max_tool_calls_per_execution(max_tool_calls_per_execution)
         self.sync_files = sync_files
         self.tools = dict(tools) if tools else {}
         self.output_fields = output_fields
@@ -177,6 +193,63 @@ class PythonInterpreter:
         self._request_id = 0
         self._owner_thread: int | None = None
         self._pending_large_vars = {}
+        self._active_max_tool_calls_per_execution: int | None = None
+        self._tool_calls_this_execution = 0
+
+    @staticmethod
+    def _validate_max_cpu_time_seconds(value: float | None) -> float | None:
+        if value is None:
+            return None
+
+        value = float(value)
+        if value <= 0:
+            raise ValueError("max_cpu_time_seconds must be positive when provided")
+        return value
+
+    @staticmethod
+    def _validate_max_tool_calls_per_execution(value: int | None) -> int | None:
+        if value is None:
+            return None
+
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("max_tool_calls_per_execution must be an integer when provided")
+        if value <= 0:
+            raise ValueError("max_tool_calls_per_execution must be positive when provided")
+        return value
+
+    @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def _clock_ticks_per_second() -> int:
+        return int(os.sysconf("SC_CLK_TCK"))
+
+    @staticmethod
+    def _supports_process_cpu_time_limit() -> bool:
+        return sys.platform.startswith("linux") and os.path.exists("/proc/self/stat")
+
+    @classmethod
+    def _get_process_cpu_time_seconds(cls, process: subprocess.Popen[str] | None) -> float | None:
+        if process is None:
+            return None
+
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            return None
+
+        try:
+            with open(f"/proc/{pid}/stat") as stat_file:
+                stat_contents = stat_file.read()
+        except OSError:
+            return None
+
+        try:
+            _, rest = stat_contents.rsplit(") ", 1)
+            fields = rest.split()
+            utime_ticks = int(fields[11])
+            stime_ticks = int(fields[12])
+        except (IndexError, ValueError):
+            return None
+
+        return (utime_ticks + stime_ticks) / cls._clock_ticks_per_second()
 
     def _check_thread_ownership(self) -> None:
         """Ensure this interpreter is only used from a single thread."""
@@ -257,9 +330,13 @@ class PythonInterpreter:
         return params
 
     def _register_tools(self) -> None:
-        """Register tools and output fields with the sandbox."""
-        if self._tools_registered:
-            return
+        """Refresh tools and SUBMIT bindings inside the sandbox.
+
+        Registration is intentionally replayed before every execution. The REPL
+        state persists across iterations, so user code can accidentally shadow a
+        tool name or ``SUBMIT``. Re-registering keeps those bindings
+        self-healing instead of relying on a once-per-process install.
+        """
 
         # Build registration params with typed tool signatures
         params = {}
@@ -273,12 +350,7 @@ class PythonInterpreter:
         if self.output_fields:
             params["outputs"] = self.output_fields
 
-        # Skip if nothing to register
-        if not params:
-            self._tools_registered = True
-            return
-
-        self._send_request("register", params, "registering tools/outputs")
+        self._send_request("register", params, "registering tools/output bindings")
         self._tools_registered = True
 
     def _handle_tool_call(self, request: dict) -> None:
@@ -287,6 +359,17 @@ class PythonInterpreter:
         params = request.get("params", {})
         tool_name = params.get("name")
         kwargs = params.get("kwargs", {})
+
+        limit = self._active_max_tool_calls_per_execution
+        if limit is not None:
+            next_tool_call_count = self._tool_calls_this_execution + 1
+            if next_tool_call_count > limit:
+                self.reset()
+                raise CodeInterpreterError(
+                    f"Tool call limit exceeded ({limit}) during execution. "
+                    "The sandbox process was restarted; please retry the operation with fewer tool calls in one iteration."
+                )
+            self._tool_calls_this_execution = next_tool_call_count
 
         try:
             if tool_name not in self.tools:
@@ -307,6 +390,83 @@ class PythonInterpreter:
 
         self.deno_process.stdin.write(response + "\n")
         self.deno_process.stdin.flush()
+
+    def _clear_session_state(self) -> None:
+        """Clear process-local state so a new sandbox starts from scratch."""
+        self.deno_process = None
+        self._mounted_files = False
+        self._tools_registered = False
+        self._owner_thread = None
+        self._pending_large_vars = {}
+        self._request_id = 0
+        self._active_max_tool_calls_per_execution = None
+        self._tool_calls_this_execution = 0
+
+    @staticmethod
+    def _close_process_streams(process: subprocess.Popen[str] | Any) -> None:
+        """Best-effort close of all parent-side subprocess pipe handles."""
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, stream_name, None)
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _stop_process(self, force: bool = False) -> None:
+        """Stop the current Deno process.
+
+        If ``force`` is True, kill the process directly instead of asking the
+        runner to shut down gracefully. This is useful after memory pressure,
+        where we want to release the sandbox's memory as aggressively as
+        possible.
+        """
+        process = self.deno_process
+        if process is None:
+            return
+
+        if process.poll() is not None:
+            self._close_process_streams(process)
+            return
+
+        stdin = getattr(process, "stdin", None)
+        try:
+            if stdin is not None and not force:
+                stdin.write(_jsonrpc_notification("shutdown") + "\n")
+                stdin.flush()
+        except Exception:
+            pass
+
+        try:
+            self._close_process_streams(process)
+        except Exception:
+            pass
+
+        try:
+            if force:
+                process.kill()
+            else:
+                process.wait(timeout=1)
+                return
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        except Exception:
+            if force:
+                pass
+            else:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        try:
+            process.wait(timeout=1)
+        except Exception:
+            pass
 
     def _ensure_deno_process(self) -> None:
         if self.deno_process is None or self.deno_process.poll() is not None:
@@ -337,9 +497,47 @@ class PythonInterpreter:
 
     _MAX_SKIP_LINES = 100
 
-    def _read_response_line(self, context: str) -> str:
+    def _read_response_line(
+        self,
+        context: str,
+        max_cpu_time_seconds: float | None = None,
+        cpu_time_start: float | None = None,
+    ) -> str:
         """Read one stdout line from Deno or raise a process-level error."""
-        response_line = self.deno_process.stdout.readline().strip()
+
+        if max_cpu_time_seconds is not None and not self._supports_process_cpu_time_limit():
+            raise NotImplementedError(
+                "max_cpu_time_seconds is currently supported only on Linux hosts with /proc process accounting"
+            )
+
+        stdout = self.deno_process.stdout
+        if max_cpu_time_seconds is not None and hasattr(stdout, "fileno"):
+            poll_interval = min(0.05, max(0.001, max_cpu_time_seconds / 5))
+            while True:
+                ready, _, _ = select.select([stdout], [], [], poll_interval)
+                if ready:
+                    response_line = stdout.readline().strip()
+                    if response_line:
+                        return response_line
+                else:
+                    current_cpu_time = self._get_process_cpu_time_seconds(self.deno_process)
+                    if (
+                        current_cpu_time is not None
+                        and cpu_time_start is not None
+                        and (current_cpu_time - cpu_time_start) > max_cpu_time_seconds
+                    ):
+                        self.reset()
+                        raise CodeInterpreterError(
+                            f"CPU time limit exceeded ({max_cpu_time_seconds:.3f}s) {context}. "
+                            "The sandbox process was restarted; please retry the operation."
+                        )
+
+                exit_code = self.deno_process.poll()
+                if exit_code is not None:
+                    stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
+                    raise CodeInterpreterError(f"Deno exited (code {exit_code}) {context}: {stderr}")
+
+        response_line = stdout.readline().strip()
         if response_line:
             return response_line
 
@@ -361,11 +559,64 @@ class PythonInterpreter:
             logger.debug("Skipping malformed JSON during %s: %s", context, response_line[:100])
             return None
 
+    def _reset_process_after_protocol_error(self) -> None:
+        """Tear down the current subprocess after a protocol desynchronization.
+
+        Once stdout contains an unexpected JSON-RPC response, the stream can no
+        longer be trusted. Resetting the process is safer than trying to drain
+        and continue with a contaminated channel.
+        """
+        process = self.deno_process
+        self.deno_process = None
+        self._tools_registered = False
+        self._mounted_files = False
+
+        if process is None:
+            return
+
+        try:
+            self._close_process_streams(process)
+        except Exception:
+            pass
+
+        try:
+            if process.poll() is None:
+                terminate = getattr(process, "terminate", None)
+                if callable(terminate):
+                    terminate()
+                wait = getattr(process, "wait", None)
+                if callable(wait):
+                    try:
+                        wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        kill = getattr(process, "kill", None)
+                        if callable(kill):
+                            kill()
+                        wait(timeout=1)
+        except Exception:
+            pass
+
+    def _raise_protocol_desync(self, context: str, expected_id: Any, actual_id: Any) -> None:
+        self._reset_process_after_protocol_error()
+        raise CodeInterpreterError(
+            f"Protocol desynchronized {context}: expected response id {expected_id}, got {actual_id}. "
+            "The sandbox process was restarted; please retry the operation."
+        )
+
+    def _raise_unhandled_async_error(self, error_type: str, error_message: str, error_data: dict[str, Any]) -> None:
+        try:
+            self.reset()
+        finally:
+            message = self._format_remote_error(error_type, error_message, error_data)
+        raise CodeInterpreterError(
+            f"{message}\nThe sandbox encountered an unhandled async error and was restarted; please retry the operation."
+        )
+
     def _send_request(self, method: str, params: dict, context: str) -> dict:
         """Send a JSON-RPC request and return the parsed response.
 
-        Non-JSON lines (e.g. Pyodide package loading messages) are skipped,
-        up to ``_MAX_SKIP_LINES`` to prevent unbounded blocking.
+        Non-JSON lines are skipped up to ``_MAX_SKIP_LINES`` to prevent
+        unbounded blocking.
         """
         self._request_id += 1
         request_id = self._request_id
@@ -382,11 +633,17 @@ class PythonInterpreter:
                 continue
 
             if response.get("id") != request_id:
-                raise CodeInterpreterError(
-                    f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}"
-                )
+                self._raise_protocol_desync(context, request_id, response.get("id"))
             if "error" in response:
-                raise CodeInterpreterError(f"Error {context}: {response['error'].get('message', 'Unknown error')}")
+                error = response["error"]
+                error_data = error.get("data", {})
+                if error_data.get("unhandled_async"):
+                    self._raise_unhandled_async_error(
+                        error_data.get("type", "Error"),
+                        error.get("message", "Unknown error"),
+                        error_data,
+                    )
+                raise CodeInterpreterError(f"Error {context}: {error.get('message', 'Unknown error')}")
             return response
 
         raise CodeInterpreterError(f"Too many non-JSON lines ({skipped}) {context}")
@@ -475,13 +732,58 @@ class PythonInterpreter:
         """Inject a large variable via the virtual filesystem."""
         self._send_request("inject_var", {"name": name, "value": value}, f"injecting variable '{name}'")
 
+    @staticmethod
+    def _format_remote_error(error_type: str, error_message: str, error_data: dict[str, Any]) -> str:
+        details = error_data.get("args") or error_message or "Unknown error"
+        message = f"{error_type}: {details}"
+
+        if error_type in {"MemoryError", "ExecutionCPULimitExceeded"} or error_data.get("unhandled_async"):
+            location = error_data.get("location") or {}
+            if location:
+                filename = location.get("filename", "<unknown>")
+                lineno = location.get("lineno", "?")
+                function = location.get("function", "<module>")
+                message += f"\nLocation: {filename}:{lineno} in {function}"
+
+            traceback_text = error_data.get("traceback")
+            if traceback_text:
+                message += f"\nTraceback:\n{traceback_text.rstrip()}"
+
+        return message
+
+    @staticmethod
+    def _format_syntax_error_details(error_message: str, error_data: dict[str, Any]) -> str:
+        if error_message:
+            return error_message
+
+        args = error_data.get("args") or []
+        if args:
+            first_arg = args[0]
+            return first_arg if isinstance(first_arg, str) and first_arg else str(first_arg)
+
+        return "Unknown error"
+
     def execute(
         self,
         code: str,
         variables: dict[str, Any] | None = None,
+        max_cpu_time_seconds: float | None = None,
+        max_tool_calls_per_execution: int | None = None,
     ) -> Any:
         self._check_thread_ownership()
         variables = variables or {}
+        max_cpu_time_seconds = self._validate_max_cpu_time_seconds(max_cpu_time_seconds) or self.max_cpu_time_seconds
+        resolved_max_tool_calls_per_execution = (
+            self.max_tool_calls_per_execution
+            if max_tool_calls_per_execution is None
+            else self._validate_max_tool_calls_per_execution(max_tool_calls_per_execution)
+        )
+        self._active_max_tool_calls_per_execution = resolved_max_tool_calls_per_execution
+        self._tool_calls_this_execution = 0
+        if max_cpu_time_seconds is not None and not self._supports_process_cpu_time_limit():
+            raise NotImplementedError(
+                "max_cpu_time_seconds is currently supported only on Linux hosts with /proc process accounting"
+            )
         code = self._inject_variables(code, variables)
         self._ensure_deno_process()
         self._mount_files()
@@ -493,7 +795,12 @@ class PythonInterpreter:
         # Send the code as JSON-RPC request
         self._request_id += 1
         execute_request_id = self._request_id
-        input_data = _jsonrpc_request("execute", {"code": code}, execute_request_id)
+        input_data = _jsonrpc_request(
+            "execute", {"code": code, "max_cpu_time_seconds": max_cpu_time_seconds}, execute_request_id
+        )
+        cpu_time_start = (
+            self._get_process_cpu_time_seconds(self.deno_process) if max_cpu_time_seconds is not None else None
+        )
         try:
             self.deno_process.stdin.write(input_data + "\n")
             self.deno_process.stdin.flush()
@@ -504,6 +811,9 @@ class PythonInterpreter:
             self._register_tools()
             for name, value in self._pending_large_vars.items():
                 self._inject_large_var(name, value)
+            cpu_time_start = (
+                self._get_process_cpu_time_seconds(self.deno_process) if max_cpu_time_seconds is not None else None
+            )
             self.deno_process.stdin.write(input_data + "\n")
             self.deno_process.stdin.flush()
 
@@ -511,7 +821,11 @@ class PythonInterpreter:
         # Loop is needed because tool calls require back-and-forth communication.
         skipped = 0
         while skipped <= self._MAX_SKIP_LINES:
-            output_line = self._read_response_line("during execution")
+            output_line = self._read_response_line(
+                "during execution",
+                max_cpu_time_seconds=max_cpu_time_seconds,
+                cpu_time_start=cpu_time_start,
+            )
             msg = self._parse_response_line(output_line, "during execution")
             if msg is None:
                 skipped += 1
@@ -526,9 +840,7 @@ class PythonInterpreter:
             # Handle success response
             if "result" in msg:
                 if msg.get("id") != execute_request_id:
-                    raise CodeInterpreterError(
-                        f"Response ID mismatch: expected {execute_request_id}, got {msg.get('id')}"
-                    )
+                    self._raise_protocol_desync("during execution", execute_request_id, msg.get("id"))
                 result = msg["result"]
                 self._sync_files()
                 # Check for SUBMIT (encoded as success with "final" field)
@@ -541,19 +853,21 @@ class PythonInterpreter:
                 # Errors with id=null are unsolicited errors (e.g., unhandled async rejections)
                 # Treat them as errors for the current request
                 if msg.get("id") is not None and msg.get("id") != execute_request_id:
-                    raise CodeInterpreterError(
-                        f"Response ID mismatch: expected {execute_request_id}, got {msg.get('id')}"
-                    )
+                    self._raise_protocol_desync("during execution", execute_request_id, msg.get("id"))
                 error = msg["error"]
                 error_code = error.get("code", JSONRPC_APP_ERRORS["Unknown"])
                 error_message = error.get("message", "Unknown error")
                 error_data = error.get("data", {})
                 error_type = error_data.get("type", "Error")
 
+                if error_data.get("unhandled_async"):
+                    self._raise_unhandled_async_error(error_type, error_message, error_data)
+
                 if error_code == JSONRPC_APP_ERRORS["SyntaxError"]:
-                    raise SyntaxError(f"Invalid Python syntax. message: {error_message}")
+                    syntax_details = self._format_syntax_error_details(error_message, error_data)
+                    raise SyntaxError(f"Invalid Python syntax. message: {syntax_details}")
                 else:
-                    raise CodeInterpreterError(f"{error_type}: {error_data.get('args') or error_message}")
+                    raise CodeInterpreterError(self._format_remote_error(error_type, error_message, error_data))
 
             # Unexpected message format - neither a recognized method nor a response
             raise CodeInterpreterError(f"Unexpected message format from sandbox: {msg}")
@@ -571,6 +885,18 @@ class PythonInterpreter:
         """
         self._ensure_deno_process()
 
+    def reset(self) -> None:
+        """Force-clear the current sandbox state without starting a new one.
+
+        This is stronger than shutdown()+start() because it kills the process
+        immediately, ensuring the OS can reclaim the sandbox's memory before a
+        new interpreter session is created.
+        """
+        try:
+            self._stop_process(force=True)
+        finally:
+            self._clear_session_state()
+
     def __enter__(self):
         return self
 
@@ -581,14 +907,18 @@ class PythonInterpreter:
         self,
         code: str,
         variables: dict[str, Any] | None = None,
+        max_cpu_time_seconds: float | None = None,
+        max_tool_calls_per_execution: int | None = None,
     ) -> Any:
-        return self.execute(code, variables)
+        return self.execute(
+            code,
+            variables,
+            max_cpu_time_seconds=max_cpu_time_seconds,
+            max_tool_calls_per_execution=max_tool_calls_per_execution,
+        )
 
     def shutdown(self) -> None:
-        if self.deno_process and self.deno_process.poll() is None:
-            self.deno_process.stdin.write(_jsonrpc_notification("shutdown") + "\n")
-            self.deno_process.stdin.flush()
-            self.deno_process.stdin.close()
-            self.deno_process.wait()
-        self.deno_process = None
-        self._owner_thread = None
+        try:
+            self._stop_process(force=False)
+        finally:
+            self._clear_session_state()

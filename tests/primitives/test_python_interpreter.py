@@ -1,5 +1,7 @@
+import json
 import os
 import random
+import subprocess
 
 import pytest
 
@@ -49,6 +51,17 @@ def test_failure_syntax_error():
             interpreter.execute(code)
 
 
+def test_failure_syntax_error_includes_details():
+    with PythonInterpreter() as interpreter:
+        code = "parse(error"
+        with pytest.raises(SyntaxError, match="Invalid Python syntax") as exc_info:
+            interpreter.execute(code)
+
+    message = str(exc_info.value)
+    assert message.startswith("Invalid Python syntax. message: ")
+    assert message.split("message: ", 1)[1].strip()
+
+
 def test_failure_zero_division():
     with PythonInterpreter() as interpreter:
         code = "1+0/0"
@@ -62,6 +75,18 @@ def test_exception_args():
         code = f"raise ValueError({token})"
         with pytest.raises(CodeInterpreterError, match=rf"ValueError: \[{token}\]"):
             interpreter.execute(code)
+
+
+def test_memory_error_includes_location():
+    with PythonInterpreter() as interpreter:
+        code = "def blow_up():\n    raise MemoryError()\n\nblow_up()"
+        with pytest.raises(CodeInterpreterError, match="MemoryError") as exc_info:
+            interpreter.execute(code)
+
+    message = str(exc_info.value)
+    assert "Location:" in message
+    assert "blow_up" in message
+    assert "Traceback:" in message
 
 
 def test_submit_with_list():
@@ -159,13 +184,90 @@ def test_enable_net_flag():
 
     with PythonInterpreter(enable_network_access=None) as interpreter:
         code = f"import js\nresp = await js.fetch({test_url!r})\nresp.status"
-        with pytest.raises(CodeInterpreterError, match="PythonError"):
+        with pytest.raises(CodeInterpreterError) as exc_info:
             interpreter.execute(code)
+
+        message = str(exc_info.value)
+        assert "JsException" in message
+        assert "Requires net access" in message
+
+        # The denied fetch should surface as a normal, recoverable sandbox
+        # exception so a follow-up execute still works.
+        assert interpreter.execute("1 + 1") == 2
 
     with PythonInterpreter(enable_network_access=["example.com"]) as interpreter:
         code = f"import js\nresp = await js.fetch({test_url!r})\nresp.status"
         result = interpreter.execute(code)
         assert int(result) == 200, "Network access is permitted with enable_network_access"
+
+
+def test_cpu_time_limit_interrupts_busy_loop_and_recovers():
+    code = "while True:\n    pass"
+
+    with PythonInterpreter(max_cpu_time_seconds=0.01) as interpreter:
+        with pytest.raises(CodeInterpreterError, match="CPU time limit exceeded") as exc_info:
+            interpreter.execute(code)
+
+        message = str(exc_info.value)
+        assert "restarted" in message
+
+        # The process should be recreated cleanly after the budget kill.
+        assert interpreter.execute("1 + 1") == 2
+
+
+def test_cpu_time_limit_can_be_set_per_execution():
+    with PythonInterpreter() as interpreter:
+        result = interpreter.execute("sum(range(10_000))", max_cpu_time_seconds=0.25)
+        assert result == sum(range(10_000))
+
+
+def test_invalid_cpu_time_limit_raises_value_error():
+    with pytest.raises(ValueError, match="max_cpu_time_seconds must be positive"):
+        PythonInterpreter(max_cpu_time_seconds=0)
+
+    with PythonInterpreter() as interpreter:
+        with pytest.raises(ValueError, match="max_cpu_time_seconds must be positive"):
+            interpreter.execute("1 + 1", max_cpu_time_seconds=-1)
+
+
+def test_tool_call_limit_interrupts_runaway_tool_loop_and_recovers():
+    def ping(index: int) -> str:
+        return f"seen-{index}"
+
+    code = "for i in range(10):\n    ping(index=i)"
+
+    with PythonInterpreter(tools={"ping": ping}, max_tool_calls_per_execution=3) as interpreter:
+        with pytest.raises(CodeInterpreterError, match=r"Tool call limit exceeded \(3\)") as exc_info:
+            interpreter.execute(code)
+
+        message = str(exc_info.value)
+        assert "restarted" in message
+
+        # The process should be recreated cleanly after the limit kill.
+        assert interpreter.execute("1 + 1") == 2
+
+
+def test_tool_call_limit_can_be_set_per_execution():
+    def ping(index: int) -> str:
+        return f"seen-{index}"
+
+    with PythonInterpreter(tools={"ping": ping}) as interpreter:
+        assert interpreter.execute("ping(index=1)", max_tool_calls_per_execution=1) == "seen-1"
+
+        with pytest.raises(CodeInterpreterError, match=r"Tool call limit exceeded \(1\)"):
+            interpreter.execute("ping(index=1)\nping(index=2)", max_tool_calls_per_execution=1)
+
+
+def test_invalid_tool_call_limit_raises():
+    with pytest.raises(ValueError, match="max_tool_calls_per_execution must be positive"):
+        PythonInterpreter(max_tool_calls_per_execution=0)
+
+    with pytest.raises(TypeError, match="max_tool_calls_per_execution must be an integer"):
+        PythonInterpreter(max_tool_calls_per_execution=True)
+
+    with PythonInterpreter() as interpreter:
+        with pytest.raises(ValueError, match="max_tool_calls_per_execution must be positive"):
+            interpreter.execute("1 + 1", max_tool_calls_per_execution=-1)
 
 
 def test_interpreter_security_filesystem_access(tmp_path):
@@ -425,6 +527,77 @@ SUBMIT(a, s)
         assert result.output == {"answer": "my answer", "score": 42}
 
 
+def test_tool_call_followed_by_submit_returns_final_output():
+    """A tool call and SUBMIT should work in the same execution."""
+
+    def validate_document_context(document_context: dict, document_content: str) -> dict:
+        return {
+            **document_context,
+            "document_length": len(document_content),
+        }
+
+    output_fields = [{"name": "document_context", "type": "dict"}]
+
+    with PythonInterpreter(
+        tools={"validate_document_context": validate_document_context},
+        output_fields=output_fields,
+    ) as sandbox:
+        result = sandbox.execute(
+            "document_context = {'title': 'Example'}\n"
+            "validated_context = validate_document_context(document_context, document_content)\n"
+            "SUBMIT(validated_context)",
+            variables={"document_content": "abc"},
+        )
+
+        assert isinstance(result, FinalOutput)
+        assert result.output == {
+            "document_context": {
+                "title": "Example",
+                "document_length": 3,
+            }
+        }
+
+
+def test_submit_is_restored_after_shadowing():
+    """SUBMIT should be refreshed before each execution, even if user code overwrote it."""
+
+    with PythonInterpreter(output_fields=[{"name": "answer", "type": "str"}]) as sandbox:
+        first = sandbox.execute('SUBMIT("ok")')
+        assert first == FinalOutput({"answer": "ok"})
+
+        assert sandbox.execute("def SUBMIT(value):\n    return None") == ""
+
+        second = sandbox.execute('SUBMIT("restored")')
+        assert second == FinalOutput({"answer": "restored"})
+
+
+def test_default_submit_is_restored_after_shadowing():
+    """Default single-output SUBMIT should also be restored after shadowing."""
+
+    with PythonInterpreter() as sandbox:
+        first = sandbox.execute('SUBMIT("ok")')
+        assert first == FinalOutput({"output": "ok"})
+
+        assert sandbox.execute("def SUBMIT(value):\n    return None") == ""
+
+        second = sandbox.execute('SUBMIT("restored")')
+        assert second == FinalOutput({"output": "restored"})
+
+
+def test_tool_is_restored_after_shadowing():
+    """Tool wrappers should be refreshed before each execution."""
+
+    def lookup(key: str) -> str:
+        return key.upper()
+
+    with PythonInterpreter(tools={"lookup": lookup}) as sandbox:
+        assert sandbox.execute('lookup("apple")') == "APPLE"
+
+        assert sandbox.execute('lookup = "shadowed"') == ""
+
+        assert sandbox.execute('lookup("banana")') == "BANANA"
+
+
 def test_submit_wrong_arg_count():
     """Test SUBMIT with wrong number of args gives clear error."""
 
@@ -625,3 +798,58 @@ def test_enable_read_paths_multiple_files(tmp_path):
         assert contents["test1.txt"] == "Content 1"
         assert contents["test2.txt"] == "Content 2"
         assert contents["test3.txt"] == "Content 3"
+
+
+def test_multiple_tool_calls_returning_json():
+    """Multiple host tool calls returning dicts should work in one execution."""
+
+    def lookup(value: int) -> dict[str, int]:
+        return {"value": value, "square": value * value}
+
+    with PythonInterpreter(tools={"lookup": lookup}) as interpreter:
+        code = "results = []\nfor i in range(5):\n    results.append(lookup(i))\nresults"
+        result = interpreter.execute(code)
+
+    assert result == [
+        {"value": 0, "square": 0},
+        {"value": 1, "square": 1},
+        {"value": 2, "square": 4},
+        {"value": 3, "square": 9},
+        {"value": 4, "square": 16},
+    ]
+
+
+def test_runner_ignores_jsonrpc_responses_on_stdin():
+    """Inbound JSON-RPC responses should not be misclassified as method calls."""
+
+    interpreter = PythonInterpreter()
+    runner_path = interpreter._get_runner_path()
+    allowed_read_paths = [runner_path]
+    deno_dir = interpreter._get_deno_dir()
+    if deno_dir:
+        allowed_read_paths.append(deno_dir)
+
+    proc = subprocess.Popen(
+        ["deno", "run", f"--allow-read={','.join(allowed_read_paths)}", runner_path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="UTF-8",
+    )
+
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "result": {"ok": True}, "id": "tc_test"}) + "\n")
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "shutdown"}) + "\n")
+        proc.stdin.flush()
+
+        stdout, stderr = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    assert proc.returncode == 0
+    assert stdout.strip() == ""
+    assert "Method not found" not in stderr

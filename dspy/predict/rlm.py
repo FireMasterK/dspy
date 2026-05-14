@@ -129,6 +129,7 @@ class RLM(Module):
         signature: type[Signature] | str,
         max_iterations: int = 20,
         max_llm_calls: int = 50,
+        max_tool_calls_per_iteration: int | None = None,
         max_output_chars: int = 10_000,
         verbose: bool = False,
         tools: list[Callable] | None = None,
@@ -141,6 +142,8 @@ class RLM(Module):
                       or a Signature class.
             max_iterations: Maximum REPL interaction iterations.
             max_llm_calls: Maximum sub-LLM calls (llm_query/llm_query_batched) per execution.
+            max_tool_calls_per_iteration: Maximum host-side tool calls allowed within one REPL iteration.
+                Pass ``None`` to disable the limit.
             max_output_chars: Maximum characters to include from REPL output.
             verbose: Whether to log detailed execution info.
             tools: List of tool functions or dspy.Tool objects callable from interpreter code.
@@ -153,6 +156,7 @@ class RLM(Module):
         self.signature = ensure_signature(signature)
         self.max_iterations = max_iterations
         self.max_llm_calls = max_llm_calls
+        self.max_tool_calls_per_iteration = self._validate_max_tool_calls_per_iteration(max_tool_calls_per_iteration)
         self.max_output_chars = max_output_chars
         self.verbose = verbose
         self.sub_lm = sub_lm
@@ -164,6 +168,17 @@ class RLM(Module):
         action_sig, extract_sig = self._build_signatures()
         self.generate_action = dspy.Predict(action_sig)
         self.extract = dspy.Predict(extract_sig)
+
+    @staticmethod
+    def _validate_max_tool_calls_per_iteration(value: int | None) -> int | None:
+        if value is None:
+            return None
+
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("max_tool_calls_per_iteration must be an integer when provided")
+        if value <= 0:
+            raise ValueError("max_tool_calls_per_iteration must be positive when provided")
+        return value
 
     # =========================================================================
     # Tool Creation and Validation
@@ -300,6 +315,12 @@ class RLM(Module):
 
         # Format tool documentation for user-provided tools
         tool_docs = self._format_tool_docs(self._user_tools)
+        tool_limit_note = ""
+        if self.max_tool_calls_per_iteration is not None:
+            tool_limit_note = (
+                f"\n\nYou may make at most {self.max_tool_calls_per_iteration} host-side tool calls in a single "
+                "execution block. If you need more, stop, inspect the output, and continue in the next iteration."
+            )
 
         action_sig = (
             dspy.Signature(
@@ -311,6 +332,7 @@ class RLM(Module):
                     output_fields=output_fields,
                     max_llm_calls=self.max_llm_calls,
                 )
+                + tool_limit_note
                 + tool_docs,
             )
             .append(
@@ -422,6 +444,8 @@ class RLM(Module):
         interpreter.tools.update(execution_tools)
         if hasattr(interpreter, "output_fields"):
             interpreter.output_fields = self._get_output_fields_info()
+        if hasattr(interpreter, "max_tool_calls_per_execution"):
+            setattr(interpreter, "max_tool_calls_per_execution", self.max_tool_calls_per_iteration)
         # Reset registration flag to force re-registration with fresh tools
         if hasattr(interpreter, "_tools_registered"):
             interpreter._tools_registered = False
@@ -436,6 +460,7 @@ class RLM(Module):
             repl = PythonInterpreter(
                 tools=execution_tools,
                 output_fields=self._get_output_fields_info(),
+                max_tool_calls_per_execution=self.max_tool_calls_per_iteration,
             )
             try:
                 yield repl
@@ -561,6 +586,55 @@ class RLM(Module):
             logger.info(REPLEntry.format_output(output, self.max_output_chars))
         return history.append(reasoning=pred.reasoning, code=code, output=output)
 
+    @staticmethod
+    def _is_memory_error(error: Exception) -> bool:
+        return isinstance(error, CodeInterpreterError) and str(error).startswith("MemoryError")
+
+    @staticmethod
+    def _restart_interpreter_after_memory_error(repl: CodeInterpreter) -> tuple[bool, str | None]:
+        try:
+            reset = getattr(repl, "reset", None)
+            if callable(reset):
+                reset()
+                start = getattr(repl, "start", None)
+                if callable(start):
+                    start()
+                return True, None
+
+            if isinstance(repl, PythonInterpreter):
+                repl.shutdown()
+                repl.start()
+                return True, None
+
+            return False, None
+        except Exception as restart_error:  # pragma: no cover - defensive path
+            return False, str(restart_error)
+
+    @classmethod
+    def _format_memory_error_for_agent(cls, repl: CodeInterpreter, error: Exception) -> str:
+        restarted, restart_error = cls._restart_interpreter_after_memory_error(repl)
+        message = f"[Error] {error}"
+
+        if restarted:
+            message += (
+                "\n[Interpreter restarted] The sandbox ran out of memory and was restarted. "
+                "All variables, imports, and intermediate values created in previous REPL steps were lost. "
+                "Original input variables will be re-injected automatically on the next step. "
+                "Recompute any needed intermediate state and avoid storing large duplicate copies of the inputs."
+            )
+        elif restart_error:
+            message += (
+                "\n[Interpreter restart failed] DSPy tried to restart the sandbox after the MemoryError, "
+                f"but the restart failed: {restart_error}"
+            )
+        else:
+            message += (
+                "\n[Interpreter not restarted] This interpreter implementation does not support automatic reset. "
+                "If you continue, assume the REPL state may be unusable."
+            )
+
+        return message
+
     def _execute_code(
         self,
         repl: CodeInterpreter,
@@ -572,6 +646,8 @@ class RLM(Module):
             return repl.execute(code, variables=dict(input_args))
         except (CodeInterpreterError, SyntaxError) as e:
             print(f"Code execution error: {e}")
+            if self._is_memory_error(e):
+                return self._format_memory_error_for_agent(repl, e)
             return f"[Error] {e}"
 
     def _execute_iteration(

@@ -84,6 +84,40 @@ async def async_lookup_tool(key: str) -> str:
     return {"apple": "red", "banana": "yellow"}.get(key, "unknown")
 
 
+class RestartableMemoryErrorInterpreter(MockInterpreter):
+    """Test interpreter that raises MemoryError once, then succeeds after reset."""
+
+    def __init__(self):
+        super().__init__()
+        self.reset_count = 0
+        self.start_count = 0
+
+    def start(self) -> None:
+        self.start_count += 1
+        self._shutdown = False
+
+    def execute(
+        self,
+        code: str,
+        variables: dict[str, object] | None = None,
+    ):
+        if self._shutdown:
+            raise CodeInterpreterError("MockInterpreter has been shutdown")
+
+        variables = variables or {}
+        self.call_history.append((code, variables))
+        self.call_count += 1
+
+        if self.reset_count == 0:
+            raise CodeInterpreterError("MemoryError: MemoryError\nLocation: <exec>:3 in blow_up")
+
+        return FinalOutput({"answer": "recovered"})
+
+    def reset(self) -> None:
+        self.reset_count += 1
+        self._shutdown = False
+
+
 # ============================================================================
 # Unit Tests: MockInterpreter
 # ============================================================================
@@ -566,6 +600,25 @@ class TestRLMMaxIterationsFallback:
 
 class TestRLMToolExceptions:
     """Tests for tool exception handling."""
+
+    def test_memory_error_restarts_interpreter_and_informs_agent(self):
+        """MemoryError should reset the interpreter and explain state loss in history."""
+        mock = RestartableMemoryErrorInterpreter()
+        rlm = RLM("query -> answer", max_iterations=5, interpreter=mock)
+        rlm.generate_action = make_mock_predictor(
+            [
+                {"reasoning": "This will OOM", "code": "huge = 'x' * 10"},
+                {"reasoning": "Recover after restart", "code": 'SUBMIT("recovered")'},
+            ]
+        )
+
+        result = rlm.forward(query="test")
+
+        assert result.answer == "recovered"
+        assert mock.reset_count == 1
+        assert mock.start_count == 1
+        assert "[Interpreter restarted]" in result.trajectory[0]["output"]
+        assert "Original input variables will be re-injected automatically" in result.trajectory[0]["output"]
 
     def test_tool_exception_returns_error_in_output(self):
         """Test that tool exceptions are caught and returned as errors."""
@@ -1165,6 +1218,55 @@ class TestRLMWithDummyLM:
             result = rlm.forward(query="Double ten")
 
             assert result.answer == 20
+            assert len(result.trajectory) == 2
+
+    def test_restores_submit_and_tool_bindings_between_iterations_e2e(self):
+        """Tool wrappers and SUBMIT should be refreshed before each REPL execution."""
+
+        def lookup(key: str) -> str:
+            return key.upper()
+
+        with dummy_lm_context(
+            [
+                {
+                    "reasoning": "Accidentally shadow the built-ins",
+                    "code": 'lookup = "shadowed"\ndef SUBMIT(value):\n    return None\nprint("shadowed")',
+                },
+                {
+                    "reasoning": "Now use the restored bindings",
+                    "code": 'color = lookup("apple")\nSUBMIT(color)',
+                },
+            ]
+        ):
+            rlm = RLM("fruit -> color: str", max_iterations=2, tools=[lookup])
+            result = rlm.forward(fruit="apple")
+
+            assert result.color == "APPLE"
+            assert len(result.trajectory) == 2
+
+    def test_tool_call_limit_per_iteration_e2e(self):
+        """RLM should cap host-side tool calls per iteration and recover on the next step."""
+
+        def ping(index: int) -> str:
+            return f"seen-{index}"
+
+        with dummy_lm_context(
+            [
+                {
+                    "reasoning": "Loop on a tool too many times",
+                    "code": "for i in range(10):\n    ping(index=i)",
+                },
+                {
+                    "reasoning": "Recover after the limit reset",
+                    "code": 'SUBMIT("recovered")',
+                },
+            ]
+        ):
+            rlm = RLM("query -> answer: str", max_iterations=2, max_tool_calls_per_iteration=3, tools=[ping])
+            result = rlm.forward(query="test")
+
+            assert result.answer == "recovered"
+            assert "Tool call limit exceeded (3)" in result.trajectory[0]["output"]
             assert len(result.trajectory) == 2
 
     def test_with_input_variables_e2e(self):
